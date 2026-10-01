@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# Captura el estado del sistema de despacho con herramientas del SO.
+#
+# Uso: scripts/observar.sh [PID_principal] [archivo_salida]
+#   PID_principal : por defecto se busca el proceso llamado "centro_despacho".
+#   archivo_salida: si se indica, la salida también se guarda en ese archivo.
+
+set -euo pipefail
+
+PID="${1:-$(pgrep -xo centro_despacho || true)}"
+SALIDA="${2:-/dev/null}"
+
+if [[ -z "$PID" ]] || [[ ! -d "/proc/$PID" ]]; then
+    echo "No se encontró el proceso principal (centro_despacho). ¿Está en ejecución?" >&2
+    exit 1
+fi
+
+HIJOS="$(pgrep -P "$PID" | paste -sd, -)"
+TODOS="$PID${HIJOS:+,$HIJOS}"
+
+titulo() { printf '\n===== %s =====\n' "$1"; }
+
+{
+    echo "Captura: $(date '+%Y-%m-%d %H:%M:%S') | kernel $(uname -r) | PID principal: $PID"
+
+    titulo "1. Jerarquía de procesos e hilos (pstree -p -t: {..} = hilos)"
+    pstree -p -t "$PID"
+
+    titulo "2. Procesos: identidad, estado y recursos (ps -o)"
+    ps -o pid,ppid,pgid,stat,nlwp,pcpu,pmem,rss,vsz,etime,comm,args -p "$TODOS"
+
+    titulo "3. Hilos de cada proceso (ps -eLf filtrado; LWP = TID del kernel)"
+    ps -eLf | awk -v pids=",$TODOS," 'NR==1 || index(pids, ","$2",")'
+
+    titulo "4. Hilos con nombre, estado y CPU (ps -L)"
+    ps -L -o pid,lwp,stat,pcpu,wchan:24,comm -p "$TODOS"
+
+    titulo "5. /proc/<pid>/status (campos relevantes)"
+    for p in ${TODOS//,/ }; do
+        echo "-- PID $p"
+        grep -E '^(Name|State|Pid|PPid|Threads|VmRSS|VmSize):' "/proc/$p/status" | sed 's/^/   /'
+        # Los cambios de contexto de /proc/<pid>/status son sólo los del hilo líder; los del
+        # proceso completo se obtienen sumando los de cada hilo en /proc/<pid>/task/*/status.
+        cat /proc/"$p"/task/*/status 2>/dev/null | awk '
+            /^voluntary_ctxt/ {v += $2} /^nonvoluntary_ctxt/ {n += $2}
+            END {printf "   cambios de contexto (todos los hilos): voluntarios=%d involuntarios=%d\n", v, n}'
+        # PSS reparte las páginas compartidas (copy-on-write tras fork) entre quienes
+        # las comparten; a diferencia de RSS, la suma de PSS sí es la memoria real.
+        grep -E '^(Rss|Pss|Shared_Clean|Private_Dirty):' "/proc/$p/smaps_rollup" 2>/dev/null \
+            | sed 's/^/   /' || true
+    done
+
+    titulo "6. Memoria compartida: segmentos de /dev/shm mapeados por cada proceso"
+    echo "   (mismo INODO en varios procesos = mismas páginas físicas; pym-* = RawArray/RawValue,"
+    echo "    sem.* = semáforos y locks POSIX; '(deleted)' = sin nombre, vive mientras esté mapeado)"
+    for p in ${TODOS//,/ }; do
+        echo "-- PID $p ($(cat /proc/$p/comm))"
+        awk '/\/dev\/shm/ {printf "   inodo %-8s %s %s\n", $5, $6, $7}' "/proc/$p/maps" | sort -u
+    done
+} | tee "$SALIDA"
